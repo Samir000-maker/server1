@@ -1,5 +1,5 @@
 /* server.js
-   Fixed: only use sessions/transactions when Mongo supports them.
+   Fixed: Added trust proxy configuration for reverse proxy environments (Render, Heroku, etc.)
    Single-file Express + Mongoose server (no .env).
    Server listens on port 5000 (all workers).
 */
@@ -106,6 +106,14 @@ if (cluster.isPrimary) {
   // ---------------- WORKER PROCESS ----------------
   const app = express();
   const PORT = 5000; // <- all workers listen on port 5000
+
+  // ========== FIX: Enable trust proxy for reverse proxy environments ==========
+  // CRITICAL: This must be set BEFORE rate limiters are configured
+  // For Render, Heroku, AWS ELB, and similar platforms with a single reverse proxy
+  // Set to 1 to trust the first proxy (the platform's load balancer/proxy)
+  app.set('trust proxy', 1);
+  console.log(`Worker ${processId} - trust proxy enabled for reverse proxy environment`);
+  // ============================================================================
 
   app.use(helmet({
     contentSecurityPolicy: {
