@@ -75,7 +75,32 @@ const followingSchema = new mongoose.Schema({
   }]
 }, { collection: 'following' });
 
+
 const Following = mongoose.models.Following || mongoose.model('Following', followingSchema);
+
+
+
+const userSchema = new mongoose.Schema({
+  uid: { type: String, required: true, unique: true, index: true },
+  username: { type: String, required: true, unique: true, trim: true, minlength: 3, maxlength: 30, index: true },
+  name: { type: String, required: true, trim: true, maxlength: 100 },
+  // --- NEW FIELDS ---
+  bio: { type: String, default: '', maxlength: 150, trim: true },
+  website: { type: String, default: '', maxlength: 200, trim: true },
+  pronouns: { type: String, default: '', maxlength: 20, trim: true },
+  gender: { type: String, default: 'Prefer not to say' },
+  // ------------------
+  interests: { type: [String], default: [] },
+  postCount: { type: Number, default: 0, min: 0 },
+  followers: { type: Number, default: 0, min: 0 },
+  accountCreationTimestamp: { type: Date, default: Date.now, index: true },
+  profilePictureUrl: { type: String, default: null },
+  isActive: { type: Boolean, default: true, index: true },
+  lastLoginTimestamp: { type: Date, default: Date.now }
+}, { timestamps: true, collection: 'users' });
+
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+
 
 
 // will be set to true/false after we connect
@@ -250,6 +275,7 @@ app.get("/health", (req, res) => {
 });
 
 
+
 // Alternative simple health check (if you prefer minimal response)
 app.get('/ping', (req, res) => {
   res.status(200).send('pong');
@@ -257,7 +283,84 @@ app.get('/ping', (req, res) => {
 
 
 
+app.patch('/api/users/:uid/profile', async (req, res) => {
+  const session = canUseTransactions ? await mongoose.startSession() : null;
+  if (session) session.startTransaction();
 
+  try {
+    const { uid } = req.params;
+    const { username, name, bio, website, pronouns, gender } = req.body;
+
+    // 1. Basic Validation
+    if (!validate.userId(uid)) {
+      return res.status(400).json({ success: false, error: 'Invalid UID' });
+    }
+
+    // 2. Build Update Object (Only include fields that are present)
+    const updateData = {};
+    if (name) updateData.name = validate.sanitize(name);
+    if (bio !== undefined) updateData.bio = validate.sanitize(bio);
+    if (website !== undefined) updateData.website = validate.sanitize(website);
+    if (pronouns !== undefined) updateData.pronouns = validate.sanitize(pronouns);
+    if (gender !== undefined) updateData.gender = validate.sanitize(gender);
+    
+    // 3. Special Handling for Username (Uniqueness Check)
+    if (username) {
+      const sanitizedUsername = validate.sanitize(username).replace(/[^a-zA-Z0-9_-]/g, '');
+      
+      // Check if username is actually changing
+      const currentUser = await User.findOne({ uid }).select('username');
+      
+      if (currentUser && currentUser.username !== sanitizedUsername) {
+        // Check if taken by SOMEONE ELSE
+        const existing = await User.findOne({ 
+          username: { $regex: new RegExp(`^${sanitizedUsername}$`, 'i') },
+          uid: { $ne: uid } // Exclude current user
+        });
+        
+        if (existing) {
+          if (session) await session.abortTransaction();
+          return res.status(409).json({ success: false, error: 'Username is already taken' });
+        }
+        updateData.username = sanitizedUsername;
+      }
+    }
+
+    // 4. Atomic Update (The "Superfast" Single Operation)
+    const options = { new: true, runValidators: true, lean: true };
+    if (session) options.session = session;
+
+    const updatedUser = await User.findOneAndUpdate(
+      { uid: uid },
+      { $set: updateData },
+      options
+    ).select('-password -__v -_id'); // Exclude internal fields
+
+    if (!updatedUser) {
+      if (session) await session.abortTransaction();
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    if (session) await session.commitTransaction();
+
+    console.log(`[PROFILE UPDATE] User ${uid} updated profile successfully.`);
+    
+    res.status(200).json({ 
+      success: true, 
+      message: 'Profile updated successfully', 
+      user: updatedUser 
+    });
+
+  } catch (err) {
+    if (session) await session.abortTransaction();
+    console.error('Update profile error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  } finally {
+    if (session) await session.endSession();
+  }
+});
+
+   
 
 
 // Get user's following list
