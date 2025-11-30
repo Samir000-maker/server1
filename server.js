@@ -724,13 +724,18 @@ app.get('/api/users/search/query', async (req, res) => {
   try {
     const { q } = req.query;
 
+    console.log(`[SEARCH] Request received. Raw Query: "${q}"`);
+
     if (!q || typeof q !== 'string' || q.trim().length === 0) {
+      console.warn('[SEARCH] Validation failed: Query parameter missing or empty');
       return res.status(400).json({ success: false, error: 'Query parameter required' });
     }
 
     const searchQuery = q.trim();
     // Escape special regex characters to prevent errors
     const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    console.log(`[SEARCH] Processing query: "${searchQuery}" (Escaped: "${escapedQuery}")`);
 
     const users = await User.aggregate([
       {
@@ -773,10 +778,19 @@ app.get('/api/users/search/query', async (req, res) => {
       }
     ]);
 
+    console.log(`[SEARCH] Success. Found ${users.length} results for "${searchQuery}"`);
+    
+    // Optional: Log the actual usernames found to verify order
+    if (users.length > 0) {
+        const foundUsernames = users.map(u => u.username).join(', ');
+        console.log(`[SEARCH] Results: [${foundUsernames}]`);
+    }
+
     res.status(200).json({ success: true, users });
 
   } catch (err) {
-    console.error('Search error:', err);
+    console.error('[SEARCH] Critical Error:', err);
+    console.error('[SEARCH] Stack Trace:', err.stack);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
