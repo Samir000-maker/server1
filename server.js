@@ -718,6 +718,72 @@ app.post('/api/auth/signup', validateUserInput, async (req, res) => {
     }
   });
 
+
+
+app.get('/api/users/search/query', async (req, res) => {
+  try {
+    const { q } = req.query;
+
+    if (!q || typeof q !== 'string' || q.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Query parameter required' });
+    }
+
+    const searchQuery = q.trim();
+    // Escape special regex characters to prevent errors
+    const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const users = await User.aggregate([
+      {
+        $match: {
+          username: { $regex: escapedQuery, $options: 'i' }, // Uses the username index
+          isActive: true
+        }
+      },
+      {
+        $addFields: {
+          // Score 2: Exact match (case-insensitive)
+          isExact: { 
+            $cond: [{ $eq: [{ $toLower: "$username" }, searchQuery.toLowerCase()] }, 1, 0] 
+          },
+          // Score 1: Starts with query
+          isStartsWith: { 
+            $cond: [{ $regexMatch: { input: "$username", regex: new RegExp(`^${escapedQuery}`, 'i') } }, 1, 0] 
+          }
+        }
+      },
+      {
+        // Sort: Exact match first, then "starts with", then follower count (popularity), then alphabetical
+        $sort: { 
+          isExact: -1, 
+          isStartsWith: -1, 
+          followers: -1,
+          username: 1 
+        }
+      },
+      { $limit: 10 }, // HARD LIMIT: Never read more than 10 documents into memory
+      {
+        $project: {
+          _id: 0,
+          uid: 1,
+          username: 1,
+          name: 1,
+          profilePictureUrl: 1,
+          followers: 1 // Optional: return followers if you want to show "X followers"
+        }
+      }
+    ]);
+
+    res.status(200).json({ success: true, users });
+
+  } catch (err) {
+    console.error('Search error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+   
+
+   
+
   // ---------- SERVER START & SHUTDOWN ----------
   const server = app.listen(PORT, () => {
     console.log(`Worker ${processId} listening on port ${PORT}`);
