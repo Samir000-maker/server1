@@ -80,7 +80,7 @@ const Following = mongoose.models.Following || mongoose.model('Following', follo
 
 
 
-const userSchema = new mongoose.Schema({
+const userSchema2 = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   username: { type: String, required: true, unique: true, trim: true, minlength: 3, maxlength: 30, index: true },
   name: { type: String, required: true, trim: true, maxlength: 100 },
@@ -99,7 +99,7 @@ const userSchema = new mongoose.Schema({
   lastLoginTimestamp: { type: Date, default: Date.now }
 }, { timestamps: true, collection: 'users' });
 
-const User = mongoose.models.User || mongoose.model('User', userSchema);
+const User = mongoose.models.User || mongoose.model('User', userSchema2);
 
 
 
