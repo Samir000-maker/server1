@@ -103,6 +103,27 @@ const User = mongoose.models.User || mongoose.model('User', userSchema2);
 
 
 
+
+const recentChatSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
+  chatId: { type: String, required: true },
+  otherUserId: { type: String, required: true },
+  lastMessage: { type: String, required: true },
+  lastMessageTime: { type: Number, required: true, index: true },
+  unreadCount: { type: Number, default: 0 },
+  // Cache user info to avoid extra lookups
+  otherUserName: { type: String, default: '' },
+  otherUserProfilePic: { type: String, default: '' }
+}, { timestamps: true });
+
+// Compound index for efficient queries
+recentChatSchema.index({ userId: 1, lastMessageTime: -1 });
+recentChatSchema.index({ userId: 1, chatId: 1 }, { unique: true });
+
+const RecentChat = mongoose.models.RecentChat || mongoose.model('RecentChat', recentChatSchema);
+
+
+
 // will be set to true/false after we connect
 let canUseTransactions = false;
 
@@ -906,6 +927,133 @@ app.post('/api/auth/signup', validateUserInput, async (req, res) => {
 
 
 
+app.get('/api/recent-chats/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (!validate.userId(userId)) {
+      log('warn', `Invalid userId in recent chats: ${userId}`);
+      return res.status(400).json({ success: false, error: 'Invalid user ID' });
+    }
+
+    const cleanUserId = validate.sanitize(userId);
+    
+    log('info', `Fetching recent chats for userId: ${cleanUserId}`);
+
+    // Single optimized query with sorting and limit
+    const recentChats = await RecentChat.find({ userId: cleanUserId })
+      .sort({ lastMessageTime: -1 })
+      .limit(50) // Limit to 50 most recent chats
+      .lean()
+      .maxTimeMS(3000);
+
+    log('info', `Found ${recentChats.length} recent chats for ${cleanUserId}`);
+
+    // Transform to match your client's expected format
+    const formattedChats = recentChats.map(chat => ({
+      chatId: chat.chatId,
+      otherUserId: chat.otherUserId,
+      lastMessage: chat.lastMessage,
+      lastMessageTime: chat.lastMessageTime,
+      unreadCount: chat.unreadCount || 0,
+      username: chat.otherUserName || '',
+      profilePictureUrl: chat.otherUserProfilePic || ''
+    }));
+
+    res.status(200).json({ 
+      success: true, 
+      chats: formattedChats,
+      count: formattedChats.length
+    });
+
+  } catch (err) {
+    console.error('Get recent chats error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Update recent chat (called by Socket.IO server when message is sent)
+app.post('/api/recent-chats/update', async (req, res) => {
+  try {
+    const { senderId, receiverId, chatId, lastMessage, timestamp, senderUsername, senderProfilePicUrl } = req.body;
+    
+    if (!senderId || !receiverId || !chatId || !lastMessage) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    log('info', `Updating recent chat: ${chatId}`);
+
+    const messageTime = timestamp || Date.now();
+
+    // Update sender's recent chat (shows receiver's info)
+    await RecentChat.findOneAndUpdate(
+      { userId: senderId, chatId: chatId },
+      {
+        $set: {
+          otherUserId: receiverId,
+          lastMessage: lastMessage,
+          lastMessageTime: messageTime,
+          // Don't update otherUserName/otherUserProfilePic for sender's view
+          // as it should show receiver's info (fetched separately)
+        }
+      },
+      { upsert: true, new: true }
+    );
+
+    // Update receiver's recent chat (shows sender's info)
+    await RecentChat.findOneAndUpdate(
+      { userId: receiverId, chatId: chatId },
+      {
+        $set: {
+          otherUserId: senderId,
+          lastMessage: lastMessage,
+          lastMessageTime: messageTime,
+          otherUserName: senderUsername || '',
+          otherUserProfilePic: senderProfilePicUrl || ''
+        },
+        $inc: { unreadCount: 1 } // Increment unread count for receiver
+      },
+      { upsert: true, new: true }
+    );
+
+    log('info', `Recent chat updated successfully for ${chatId}`);
+
+    res.status(200).json({ success: true, message: 'Recent chat updated' });
+
+  } catch (err) {
+    console.error('Update recent chat error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Mark chat as read (reset unread count)
+app.post('/api/recent-chats/mark-read', async (req, res) => {
+  try {
+    const { userId, chatId } = req.body;
+    
+    if (!userId || !chatId) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    log('info', `Marking chat as read: ${chatId} for user ${userId}`);
+
+    await RecentChat.findOneAndUpdate(
+      { userId: userId, chatId: chatId },
+      { $set: { unreadCount: 0 } }
+    );
+
+    res.status(200).json({ success: true, message: 'Chat marked as read' });
+
+  } catch (err) {
+    console.error('Mark chat as read error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+
+
+
+   
 
 app.get('/api/chat/user/:uid', async (req, res) => {
   try {
