@@ -912,18 +912,6 @@ app.post('/api/auth/signup', validateUserInput, async (req, res) => {
     }
   });
 
-  // 404 handler - do not pass '*' to path-to-regexp
-  app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found' });
-  });
-
-  // global error handler
-  app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
-  });
 
 
 
@@ -1156,7 +1144,25 @@ app.post('/api/chat/users/batch', async (req, res) => {
 
 
 
+
+
    
+
+  // 404 handler - do not pass '*' to path-to-regexp
+  app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Endpoint not found' });
+  });
+
+  // global error handler
+  app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  });
+
+
+
   // ---------- SERVER START & SHUTDOWN ----------
   const server = app.listen(PORT, () => {
     console.log(`Worker ${processId} listening on port ${PORT}`);
