@@ -906,6 +906,109 @@ app.post('/api/auth/signup', validateUserInput, async (req, res) => {
 
 
 
+
+app.get('/api/chat/user/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    
+    if (!validate.userId(uid)) {
+      log('warn', `Invalid UID in chat user request: ${uid}`);
+      return res.status(400).json({ success: false, error: 'Invalid UID' });
+    }
+
+    const cleanUserId = validate.sanitize(uid);
+    
+    // Single optimized query - only fetch needed fields
+    const user = await User.findOne({ uid: cleanUserId, isActive: true })
+      .select('uid username name profilePictureUrl')
+      .lean()
+      .maxTimeMS(2000); // Prevent long-running queries
+
+    if (!user) {
+      log('warn', `User not found for chat: ${cleanUserId}`);
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    log('info', `Chat user info fetched: ${user.username}`);
+
+    res.status(200).json({ 
+      success: true, 
+      user: {
+        uid: user.uid,
+        username: user.username || 'User',
+        name: user.name || 'User',
+        profilePictureUrl: user.profilePictureUrl || ''
+      }
+    });
+
+  } catch (err) {
+    console.error('Get chat user error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// Batch get multiple users for recent chats (single query for all)
+app.post('/api/chat/users/batch', async (req, res) => {
+  try {
+    const { userIds } = req.body;
+    
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'Invalid user IDs array' });
+    }
+
+    // Limit batch size to prevent abuse
+    if (userIds.length > 50) {
+      return res.status(400).json({ success: false, error: 'Too many user IDs (max 50)' });
+    }
+
+    // Validate and sanitize all IDs
+    const cleanUserIds = userIds
+      .filter(id => validate.userId(id))
+      .map(id => validate.sanitize(id));
+
+    if (cleanUserIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'No valid user IDs' });
+    }
+
+    log('info', `Batch user fetch for ${cleanUserIds.length} users`);
+
+    // Single query to get all users
+    const users = await User.find({ 
+      uid: { $in: cleanUserIds }, 
+      isActive: true 
+    })
+    .select('uid username name profilePictureUrl')
+    .lean()
+    .maxTimeMS(3000);
+
+    // Create a map for O(1) lookup
+    const userMap = {};
+    users.forEach(user => {
+      userMap[user.uid] = {
+        uid: user.uid,
+        username: user.username || 'User',
+        name: user.name || 'User',
+        profilePictureUrl: user.profilePictureUrl || ''
+      };
+    });
+
+    log('info', `Batch fetch returned ${users.length} users`);
+
+    res.status(200).json({ 
+      success: true, 
+      users: userMap,
+      count: users.length
+    });
+
+  } catch (err) {
+    console.error('Batch get users error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+
+
+   
   // ---------- SERVER START & SHUTDOWN ----------
   const server = app.listen(PORT, () => {
     console.log(`Worker ${processId} listening on port ${PORT}`);
