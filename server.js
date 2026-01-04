@@ -200,6 +200,7 @@ app.use(cors());
       try {
         await mongoose.connect(MONGODB_URI, MONGO_OPTIONS);
         console.log(`Worker ${processId} connected to MongoDB on attempt ${attempt}`);
+         await createFollowingIndexes();
         return;
       } catch (err) {
         const isLast = attempt === retries;
@@ -209,6 +210,47 @@ app.use(cors());
       }
     }
   };
+
+
+   async function createFollowingIndexes() {
+  try {
+    console.log('[INDEXES] Creating following collection indexes...');
+    
+    const db = mongoose.connection.db;
+    
+    // Following collection indexes
+    await db.collection('following').createIndex(
+      { userId: 1 },
+      { name: 'userId_lookup', background: true }
+    );
+    
+    await db.collection('following').createIndex(
+      { userId: 1, index: 1 },
+      { name: 'userId_index_lookup', background: true }
+    );
+    
+    await db.collection('following').createIndex(
+      { userId: 1, 'followingList.userId': 1 },
+      { name: 'userId_followingList_lookup', background: true, sparse: true }
+    );
+
+    // Users collection indexes (for follower count updates)
+    await db.collection('users').createIndex(
+      { uid: 1 },
+      { name: 'uid_lookup', background: true }
+    );
+
+    console.log('[INDEXES] ✅ Following indexes created successfully');
+    
+  } catch (error) {
+    // Ignore "index already exists" errors
+    if (error.code !== 85 && error.code !== 86) {
+      console.error('[INDEXES] ⚠️ Index creation warning:', error.message);
+    } else {
+      console.log('[INDEXES] ✅ Indexes already exist');
+    }
+  }
+}
 
   const detectTransactionSupport = async () => {
     try {
