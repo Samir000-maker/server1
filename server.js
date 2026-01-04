@@ -1,9 +1,3 @@
-/* server.js
-   Fixed: Added trust proxy configuration for reverse proxy environments (Render, Heroku, etc.)
-   Single-file Express + Mongoose server (no .env).
-   Server listens on port 5000 (all workers).
-*/
-
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -201,6 +195,7 @@ app.use(cors());
         await mongoose.connect(MONGODB_URI, MONGO_OPTIONS);
         console.log(`Worker ${processId} connected to MongoDB on attempt ${attempt}`);
          await createFollowingIndexes();
+         await createUserIndexes();
         return;
       } catch (err) {
         const isLast = attempt === retries;
@@ -210,6 +205,36 @@ app.use(cors());
       }
     }
   };
+
+
+
+
+
+
+async function createUserIndexes() {
+  try {
+    console.log('[INDEXES] Creating user collection indexes...');
+    
+    const db = mongoose.connection.db;
+    
+    // Existing indexes are already created by Mongoose schema
+    // Add this if you want to query users by post count
+    await db.collection('users').createIndex(
+      { postCount: -1 },
+      { name: 'postCount_desc', background: true }
+    );
+
+    console.log('[INDEXES] ✅ User indexes created successfully');
+    
+  } catch (error) {
+    if (error.code !== 85 && error.code !== 86) {
+      console.error('[INDEXES] ⚠️ User index creation warning:', error.message);
+    } else {
+      console.log('[INDEXES] ✅ User indexes already exist');
+    }
+  }
+}
+
 
 
    async function createFollowingIndexes() {
@@ -496,7 +521,50 @@ app.get('/api/posts/user/:uid', async (req, res) => {
   }
 });
 
-// Follow user
+
+// Increment user post count (called after successful upload)
+app.post('/api/users/:uid/increment-post-count', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    
+    if (!validate.userId(uid)) {
+      log('warn', `Invalid UID in increment post count: ${uid}`);
+      return res.status(400).json({ success: false, error: 'Invalid UID' });
+    }
+
+    const cleanUserId = validate.sanitize(uid);
+    
+    log('info', `Incrementing post count for userId: ${cleanUserId}`);
+
+    // Single atomic operation - only reads the document being updated
+    const result = await User.updateOne(
+      { uid: cleanUserId, isActive: true }, // Filter
+      { $inc: { postCount: 1 } }, // Increment by 1
+      { 
+        writeConcern: { w: 1 }, // Don't wait for replication
+        lean: true // Minimal overhead
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      log('warn', `User not found for post count increment: ${cleanUserId}`);
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    log('info', `Post count incremented successfully for ${cleanUserId}`);
+
+    res.status(200).json({ 
+      success: true, 
+      message: 'Post count incremented successfully'
+    });
+
+  } catch (err) {
+    console.error('Increment post count error:', err);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+
 // Follow user
 app.post('/api/users/:uid/follow', async (req, res) => {
   try {
@@ -1184,11 +1252,6 @@ app.post('/api/chat/users/batch', async (req, res) => {
   }
 });
 
-
-
-
-
-   
 
   // 404 handler - do not pass '*' to path-to-regexp
   app.use((req, res) => {
