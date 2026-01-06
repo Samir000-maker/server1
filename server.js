@@ -15,7 +15,7 @@ const MONGODB_URI = 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/yo
 const WORKER_COUNT = Math.max(1, numCPUs - 1);
 
 
-const FOLLOWING_SLOT_CAPACITY = 250; // Changed from 2 to 6
+const FOLLOWING_SLOT_CAPACITY = 250;
 
 
 // conservative per-worker pool to avoid exploding connections
@@ -58,17 +58,28 @@ const userSchema = new mongoose.Schema({
   lastLoginTimestamp: { type: Date, default: Date.now }
 }, { timestamps: true, collection: 'users' });
 
-// Create Following schema to match your Firestore structure
+// Following schema with optimized structure for billions of users
 const followingSchema = new mongoose.Schema({
-  _id: { type: String }, // This will be "currentUserId_N"
-  userId: { type: String, required: true }, // The user who is doing the following
-  index: { type: Number, required: true },
-  followingCount: { type: Number, default: 0, max: 2 },
+  _id: { type: String }, // Format: "userId_slotIndex" (e.g., "user123_1", "user123_2")
+  userId: { type: String, required: true, index: true }, // The user who is following others
+  slotIndex: { type: Number, required: true, min: 1 }, // Slot number (1, 2, 3, ...)
+  followingCount: { type: Number, default: 0, min: 0, max: FOLLOWING_SLOT_CAPACITY },
   followingList: [{
-    userId: { type: String, required: true } // The user being followed
-  }]
-}, { collection: 'following' });
+    userId: { type: String, required: true }, // The user being followed
+    followedAt: { type: Date, default: Date.now } // When they were followed
+  }],
+  createdAt: { type: Date, default: Date.now, index: true },
+  updatedAt: { type: Date, default: Date.now }
+}, { 
+  collection: 'following',
+  timestamps: true 
+});
 
+// Compound indexes for optimal query performance at scale
+followingSchema.index({ userId: 1, slotIndex: 1 }, { unique: true }); // Primary lookup
+followingSchema.index({ userId: 1, followingCount: 1 }); // Find slots with space
+followingSchema.index({ userId: 1, 'followingList.userId': 1 }); // Check if already following
+followingSchema.index({ 'followingList.userId': 1 }); // Reverse lookup (who follows X)
 
 const Following = mongoose.models.Following || mongoose.model('Following', followingSchema);
 
@@ -237,38 +248,48 @@ async function createUserIndexes() {
 
 
 
-   async function createFollowingIndexes() {
+async function createFollowingIndexes() {
   try {
     console.log('[INDEXES] Creating following collection indexes...');
     
     const db = mongoose.connection.db;
     
-    // Following collection indexes
+    // Core indexes for following system
     await db.collection('following').createIndex(
-      { userId: 1 },
-      { name: 'userId_lookup', background: true }
+      { userId: 1, slotIndex: 1 },
+      { name: 'userId_slotIndex_unique', unique: true, background: true }
     );
     
     await db.collection('following').createIndex(
-      { userId: 1, index: 1 },
-      { name: 'userId_index_lookup', background: true }
+      { userId: 1, followingCount: 1 },
+      { name: 'userId_followingCount', background: true }
     );
     
     await db.collection('following').createIndex(
       { userId: 1, 'followingList.userId': 1 },
       { name: 'userId_followingList_lookup', background: true, sparse: true }
     );
-
-    // Users collection indexes (for follower count updates)
+    
+    // Index for reverse lookups (find all users who follow a specific user)
+    await db.collection('following').createIndex(
+      { 'followingList.userId': 1 },
+      { name: 'followingList_userId_reverse', background: true, sparse: true }
+    );
+    
+    // Users collection indexes
     await db.collection('users').createIndex(
       { uid: 1 },
-      { name: 'uid_lookup', background: true }
+      { name: 'uid_lookup', unique: true, background: true }
+    );
+    
+    await db.collection('users').createIndex(
+      { followers: -1 },
+      { name: 'followers_desc', background: true }
     );
 
     console.log('[INDEXES] ✅ Following indexes created successfully');
     
   } catch (error) {
-    // Ignore "index already exists" errors
     if (error.code !== 85 && error.code !== 86) {
       console.error('[INDEXES] ⚠️ Index creation warning:', error.message);
     } else {
@@ -450,36 +471,86 @@ app.patch('/api/users/:uid/profile', async (req, res) => {
 
    
 
-
-// Get user's following list
+// Get user's following list with pagination for billions of users
 app.get('/api/users/:uid/following', async (req, res) => {
   try {
     const { uid } = req.params;
+    const { limit = 100, offset = 0 } = req.query; // Pagination support
     
     if (!validate.userId(uid)) {
       return res.status(400).json({ success: false, error: 'Invalid UID' });
     }
 
-    const followingDocs = await Following.find({ userId: uid })
-      .select('followingList')
-      .lean();
+    const cleanUserId = validate.sanitize(uid);
+    const limitNum = Math.min(parseInt(limit) || 100, 1000); // Max 1000 per request
+    const offsetNum = parseInt(offset) || 0;
+
+    console.log(`[GET-FOLLOWING] Fetching following list for ${cleanUserId}, limit=${limitNum}, offset=${offsetNum}`);
+
+    // Optimized aggregation pipeline with pagination
+    const followingAgg = await Following.aggregate([
+      // Stage 1: Match all slots for this user (uses userId index)
+      { 
+        $match: { userId: cleanUserId } 
+      },
+      
+      // Stage 2: Sort by slot index for consistent ordering
+      { 
+        $sort: { slotIndex: 1 } 
+      },
+      
+      // Stage 3: Unwind the following list
+      { 
+        $unwind: { 
+          path: '$followingList',
+          preserveNullAndEmptyArrays: false
+        } 
+      },
+      
+      // Stage 4: Project only needed fields
+      {
+        $project: {
+          _id: 0,
+          userId: '$followingList.userId',
+          followedAt: '$followingList.followedAt'
+        }
+      },
+      
+      // Stage 5: Sort by followed date (newest first)
+      {
+        $sort: { followedAt: -1 }
+      },
+      
+      // Stage 6: Pagination
+      { $skip: offsetNum },
+      { $limit: limitNum }
+    ])
+    .allowDiskUse(true) // Allow disk usage for large datasets
+    .maxTimeMS(10000); // Prevent runaway queries
+
+    // Get total count efficiently (using indexed query)
+    const totalCountResult = await Following.aggregate([
+      { $match: { userId: cleanUserId } },
+      { $group: { _id: null, total: { $sum: '$followingCount' } } }
+    ]);
     
-    const followingIds = [];
-    followingDocs.forEach(doc => {
-      if (doc.followingList && Array.isArray(doc.followingList)) {
-        doc.followingList.forEach(item => {
-          if (item.userId) followingIds.push(item.userId);
-        });
-      }
-    });
+    const totalCount = totalCountResult.length > 0 ? totalCountResult[0].total : 0;
+
+    const followingIds = followingAgg.map(item => item.userId);
+
+    console.log(`[GET-FOLLOWING] Found ${followingIds.length} following entries (total: ${totalCount}) for ${cleanUserId}`);
 
     res.status(200).json({ 
       success: true, 
       following: followingIds,
-      count: followingIds.length
+      count: followingIds.length,
+      totalCount: totalCount,
+      hasMore: (offsetNum + followingIds.length) < totalCount,
+      nextOffset: offsetNum + followingIds.length
     });
+
   } catch (err) {
-    console.error('Get following error:', err);
+    console.error('[GET-FOLLOWING-ERROR]', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -565,137 +636,203 @@ app.post('/api/users/:uid/increment-post-count', async (req, res) => {
 });
 
 
-// Follow user
 app.post('/api/users/:uid/follow', async (req, res) => {
+  const session = canUseTransactions ? await mongoose.startSession() : null;
+  
   try {
+    if (session) await session.startTransaction();
+    
     const targetUserId = req.params.uid;
     const { currentUserId } = req.body;
     
-    if (!targetUserId || !currentUserId) {
-      return res.status(400).json({ success: false, error: 'Missing user IDs' });
+    // Validation
+    if (!validate.userId(targetUserId) || !validate.userId(currentUserId)) {
+      if (session) await session.abortTransaction();
+      return res.status(400).json({ success: false, error: 'Invalid user IDs' });
     }
 
     if (targetUserId === currentUserId) {
+      if (session) await session.abortTransaction();
       return res.status(400).json({ success: false, error: 'Cannot follow yourself' });
     }
 
-    console.log(`[FOLLOW] User ${currentUserId} attempting to follow ${targetUserId}, slotCapacity=${FOLLOWING_SLOT_CAPACITY}`);
+    const cleanTargetId = validate.sanitize(targetUserId);
+    const cleanCurrentId = validate.sanitize(currentUserId);
 
-    // Check if target user exists
-    const targetUser = await User.findOne({ uid: targetUserId });
+    console.log(`[FOLLOW] User ${cleanCurrentId} attempting to follow ${cleanTargetId}, slotCapacity=${FOLLOWING_SLOT_CAPACITY}`);
+
+    // Verify target user exists
+    const targetUser = await User.findOne({ uid: cleanTargetId, isActive: true })
+      .select('uid')
+      .lean()
+      .session(session);
+      
     if (!targetUser) {
+      if (session) await session.abortTransaction();
       return res.status(404).json({ success: false, error: 'Target user not found' });
     }
 
-    // Check if already following
+    // Check if already following (indexed query)
     const existingFollow = await Following.findOne({
-      userId: currentUserId,
-      'followingList.userId': targetUserId
-    });
+      userId: cleanCurrentId,
+      'followingList.userId': cleanTargetId
+    })
+    .select('_id')
+    .lean()
+    .session(session);
 
     if (existingFollow) {
-      console.log(`[FOLLOW-DUPLICATE] User ${currentUserId} already following ${targetUserId}`);
+      if (session) await session.abortTransaction();
+      console.log(`[FOLLOW-DUPLICATE] User ${cleanCurrentId} already following ${cleanTargetId}`);
       return res.status(409).json({ success: false, error: 'Already following this user' });
     }
 
-    // Find a following document with space (followingCount < FOLLOWING_SLOT_CAPACITY)
+    // Find a slot with available space (indexed query)
     let followingDoc = await Following.findOne({
-      userId: currentUserId,
+      userId: cleanCurrentId,
       followingCount: { $lt: FOLLOWING_SLOT_CAPACITY }
-    }).sort({ index: 1 });
+    })
+    .sort({ slotIndex: 1 }) // Use oldest slot first
+    .session(session);
+
+    let slotIndex;
 
     if (!followingDoc) {
-      // Create new following document
-      const maxIndexDoc = await Following.findOne({ userId: currentUserId })
-        .sort({ index: -1 })
-        .limit(1);
+      // No slot with space found - create new slot
+      // Find the highest slot index to determine next slot number
+      const maxSlotDoc = await Following.findOne({ userId: cleanCurrentId })
+        .sort({ slotIndex: -1 })
+        .select('slotIndex')
+        .lean()
+        .session(session);
       
-      const newIndex = maxIndexDoc ? maxIndexDoc.index + 1 : 1;
-      const newDocId = `${currentUserId}_${newIndex}`;
+      slotIndex = maxSlotDoc ? maxSlotDoc.slotIndex + 1 : 1;
+      const newDocId = `${cleanCurrentId}_${slotIndex}`;
 
-      console.log(`[FOLLOW] Creating new following slot ${newIndex} for user ${currentUserId}`);
+      console.log(`[FOLLOW] Creating new slot ${slotIndex} for user ${cleanCurrentId}`);
 
       followingDoc = new Following({
         _id: newDocId,
-        userId: currentUserId,
-        index: newIndex,
+        userId: cleanCurrentId,
+        slotIndex: slotIndex,
         followingCount: 0,
         followingList: []
       });
     } else {
-      console.log(`[FOLLOW] Using existing slot ${followingDoc.index}, current count=${followingDoc.followingCount}`);
+      slotIndex = followingDoc.slotIndex;
+      console.log(`[FOLLOW] Using existing slot ${slotIndex}, current count=${followingDoc.followingCount}`);
     }
 
     // Add to following list
-    followingDoc.followingList.push({ userId: targetUserId });
+    followingDoc.followingList.push({ 
+      userId: cleanTargetId,
+      followedAt: new Date()
+    });
     followingDoc.followingCount = followingDoc.followingList.length;
-    await followingDoc.save();
+    followingDoc.updatedAt = new Date();
 
-    // Increment target user's follower count
+    // Save with session for transaction support
+    await followingDoc.save({ session });
+
+    // Increment target user's follower count atomically
     await User.updateOne(
-      { uid: targetUserId },
-      { $inc: { followers: 1 } }
+      { uid: cleanTargetId },
+      { 
+        $inc: { followers: 1 },
+        $set: { updatedAt: new Date() }
+      },
+      { session }
     );
 
-    console.log(`[FOLLOW-SUCCESS] User ${currentUserId} now following ${targetUserId}, new count=${followingDoc.followingCount}`);
+    if (session) await session.commitTransaction();
 
-    res.status(200).json({ success: true, message: 'Followed successfully', slotCapacity: FOLLOWING_SLOT_CAPACITY });
+    console.log(`[FOLLOW-SUCCESS] User ${cleanCurrentId} now following ${cleanTargetId} in slot ${slotIndex}, count=${followingDoc.followingCount}`);
+
+    res.status(200).json({ 
+      success: true, 
+      message: 'Followed successfully',
+      slotIndex: slotIndex,
+      slotCapacity: FOLLOWING_SLOT_CAPACITY
+    });
+
   } catch (err) {
+    if (session) await session.abortTransaction();
     console.error('[FOLLOW-ERROR]', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
+  } finally {
+    if (session) await session.endSession();
   }
 });
 
-// Unfollow user
-// Unfollow user - change from req.body to req.query
-// Unfollow user - Fix the MongoDB update conflict
+// Unfollow user with proper slot cleanup
 app.delete('/api/users/:uid/unfollow', async (req, res) => {
+  const session = canUseTransactions ? await mongoose.startSession() : null;
+  
   try {
+    if (session) await session.startTransaction();
+    
     const targetUserId = req.params.uid;
     const { currentUserId } = req.query;
     
-    if (!targetUserId || !currentUserId) {
-      return res.status(400).json({ success: false, error: 'Missing user IDs' });
+    if (!validate.userId(targetUserId) || !validate.userId(currentUserId)) {
+      if (session) await session.abortTransaction();
+      return res.status(400).json({ success: false, error: 'Invalid user IDs' });
     }
 
-    // Find the following document that contains this user
+    const cleanTargetId = validate.sanitize(targetUserId);
+    const cleanCurrentId = validate.sanitize(currentUserId);
+
+    console.log(`[UNFOLLOW] User ${cleanCurrentId} attempting to unfollow ${cleanTargetId}`);
+
+    // Find the slot containing this following relationship (indexed query)
     const followingDoc = await Following.findOne({
-      userId: currentUserId,
-      'followingList.userId': targetUserId
-    });
+      userId: cleanCurrentId,
+      'followingList.userId': cleanTargetId
+    }).session(session);
 
     if (!followingDoc) {
+      if (session) await session.abortTransaction();
       return res.status(409).json({ success: false, error: 'Not following this user' });
     }
 
     // Remove from following list
     followingDoc.followingList = followingDoc.followingList.filter(
-      item => item.userId !== targetUserId
+      item => item.userId !== cleanTargetId
     );
     followingDoc.followingCount = followingDoc.followingList.length;
+    followingDoc.updatedAt = new Date();
 
+    // If slot is now empty, delete it to keep database clean
     if (followingDoc.followingCount === 0) {
-      await Following.deleteOne({ _id: followingDoc._id });
+      await Following.deleteOne({ _id: followingDoc._id }, { session });
+      console.log(`[UNFOLLOW] Deleted empty slot ${followingDoc.slotIndex} for user ${cleanCurrentId}`);
     } else {
-      await followingDoc.save();
+      await followingDoc.save({ session });
+      console.log(`[UNFOLLOW] Updated slot ${followingDoc.slotIndex}, new count=${followingDoc.followingCount}`);
     }
 
-    // Fix: Use a simple decrement and handle negative values separately
-    const userUpdateResult = await User.updateOne(
-      { uid: targetUserId, followers: { $gt: 0 } }, // Only update if followers > 0
-      { $inc: { followers: -1 } }
+    // Decrement target user's follower count atomically
+    await User.updateOne(
+      { uid: cleanTargetId, followers: { $gt: 0 } },
+      { 
+        $inc: { followers: -1 },
+        $set: { updatedAt: new Date() }
+      },
+      { session }
     );
 
-    // If no document was updated (followers was already 0), just continue
-    if (userUpdateResult.matchedCount === 0) {
-      // User either doesn't exist or followers is already 0
-      console.log(`User ${targetUserId} not found or followers already at 0`);
-    }
+    if (session) await session.commitTransaction();
+
+    console.log(`[UNFOLLOW-SUCCESS] User ${cleanCurrentId} unfollowed ${cleanTargetId}`);
 
     res.status(200).json({ success: true, message: 'Unfollowed successfully' });
+
   } catch (err) {
-    console.error('Unfollow user error:', err);
+    if (session) await session.abortTransaction();
+    console.error('[UNFOLLOW-ERROR]', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
+  } finally {
+    if (session) await session.endSession();
   }
 });
 
