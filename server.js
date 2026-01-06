@@ -636,6 +636,7 @@ app.post('/api/users/:uid/increment-post-count', async (req, res) => {
 });
 
 
+// Follow user with proper slot management and backward compatibility
 app.post('/api/users/:uid/follow', async (req, res) => {
   const session = canUseTransactions ? await mongoose.startSession() : null;
   
@@ -687,26 +688,28 @@ app.post('/api/users/:uid/follow', async (req, res) => {
       return res.status(409).json({ success: false, error: 'Already following this user' });
     }
 
-    // Find a slot with available space (indexed query)
+    // Find a slot with available space - handle both old 'index' and new 'slotIndex' fields
     let followingDoc = await Following.findOne({
       userId: cleanCurrentId,
       followingCount: { $lt: FOLLOWING_SLOT_CAPACITY }
     })
-    .sort({ slotIndex: 1 }) // Use oldest slot first
+    .sort({ slotIndex: 1, index: 1 }) // Try slotIndex first, fallback to old 'index'
     .session(session);
 
     let slotIndex;
 
     if (!followingDoc) {
       // No slot with space found - create new slot
-      // Find the highest slot index to determine next slot number
+      // Find the highest slot index (check both slotIndex and old 'index' field)
       const maxSlotDoc = await Following.findOne({ userId: cleanCurrentId })
-        .sort({ slotIndex: -1 })
-        .select('slotIndex')
+        .sort({ slotIndex: -1, index: -1 })
+        .select('slotIndex index')
         .lean()
         .session(session);
       
-      slotIndex = maxSlotDoc ? maxSlotDoc.slotIndex + 1 : 1;
+      // Use slotIndex if it exists, otherwise fallback to old 'index' field
+      const currentMaxIndex = maxSlotDoc ? (maxSlotDoc.slotIndex || maxSlotDoc.index || 0) : 0;
+      slotIndex = currentMaxIndex + 1;
       const newDocId = `${cleanCurrentId}_${slotIndex}`;
 
       console.log(`[FOLLOW] Creating new slot ${slotIndex} for user ${cleanCurrentId}`);
@@ -719,7 +722,15 @@ app.post('/api/users/:uid/follow', async (req, res) => {
         followingList: []
       });
     } else {
-      slotIndex = followingDoc.slotIndex;
+      // Migrate old documents on-the-fly: if slotIndex doesn't exist, use 'index'
+      slotIndex = followingDoc.slotIndex || followingDoc.index;
+      
+      // If we're using an old document without slotIndex, set it now
+      if (!followingDoc.slotIndex && followingDoc.index) {
+        followingDoc.slotIndex = followingDoc.index;
+        console.log(`[FOLLOW-MIGRATE] Migrating document, setting slotIndex=${followingDoc.index}`);
+      }
+      
       console.log(`[FOLLOW] Using existing slot ${slotIndex}, current count=${followingDoc.followingCount}`);
     }
 
