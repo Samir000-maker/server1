@@ -15,7 +15,7 @@ const MONGODB_URI = 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/yo
 const WORKER_COUNT = Math.max(1, numCPUs - 1);
 
 
-const FOLLOWING_SLOT_CAPACITY = 250;
+const FOLLOWING_SLOT_CAPACITY = 2;
 
 
 // conservative per-worker pool to avoid exploding connections
